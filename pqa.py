@@ -9,13 +9,13 @@ Matching:
 - RapidFuzz-backed fuzzy matching (fallback to difflib)
 - Non-interactive `ask` prints the single best match (previously `best`)
 - `best` is deprecated but still works (emits a warning)
-- If invoked as `pqa`, normal subcommands apply (no implicit rewrite)
+- Intent-aware scoring: 'how-to' phrasing biases toward question-field coverage
 """
 
 from __future__ import annotations
-import argparse, json, os, sys, uuid, datetime, difflib, tempfile, shutil
+import argparse, json, os, sys, uuid, datetime, difflib, tempfile, shutil, re
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 # --- Optional fast fuzzy matcher (RapidFuzz). Falls back to difflib. ---
 _HAVE_RAPID = False
@@ -112,57 +112,128 @@ def _combine_fields_for_match(it: FAQItem) -> str:
     tg = " ".join(it.tags) if it.tags else ""
     return f"{it.question}\n{tg}\n{it.answer}".strip()
 
+# ------------------------
+# Intent-aware scoring
+# ------------------------
+
+_STOPWORDS: Set[str] = {
+    "a","an","the","do","does","did","to","of","in","on","for","with","and","or","is","are","am",
+    "be","been","being","i","you","we","they","he","she","it","my","your","our","their","me","him",
+    "her","how","what","when","where","why","which","that","this","these","those","can","could",
+    "should","would","will","shall","from","by","as","at","into","about","than","then","up","down"
+}
+
+_HOWTO_PAT = re.compile(
+    r"^\s*(?:how\s+to|how\s+do\s+i|how\s+do\s+you|how\s+can\s+i|how\s+can\s+you|what'?s\s+the\s+way\s+to)\b",
+    re.IGNORECASE
+)
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+
+def _simple_stem(tok: str) -> str:
+    # very light stemming to align close variants without extra deps
+    t = tok.lower()
+    for suf in ("ing","ed","es","s"):
+        if len(t) > 4 and t.endswith(suf):
+            return t[: -len(suf)]
+    return t
+
+def _content_tokens(text: str) -> Set[str]:
+    toks = [ _simple_stem(m.group(0)) for m in _TOKEN_RE.finditer(text.lower()) ]
+    return {t for t in toks if t and t not in _STOPWORDS}
+
+def _is_howto_query(q: str) -> bool:
+    return bool(_HOWTO_PAT.search(q))
+
+def _token_set_ratio(a: str, b: str) -> float:
+    """0..1 similarity between token sets (RapidFuzz when available, else Jaccard)."""
+    if _HAVE_RAPID:
+        # token_set_ratio returns 0..100
+        return rf_fuzz.token_set_ratio(a, b) / 100.0
+    # Fallback Jaccard over content tokens
+    A, B = _content_tokens(a), _content_tokens(b)
+    if not A and not B:
+        return 0.0
+    inter = len(A & B)
+    union = len(A | B)
+    return inter / union if union else 0.0
+
+def _wr_or_ratio(a: str, b: str) -> float:
+    """WRatio (0..1) with difflib fallback."""
+    if _HAVE_RAPID:
+        return rf_fuzz.WRatio(a, b) / 100.0
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def _coverage(query_tokens: Set[str], text: str) -> float:
+    """Fraction of query content tokens appearing in text (0..1)."""
+    if not query_tokens:
+        return 0.0
+    T = _content_tokens(text)
+    return len(query_tokens & T) / max(1, len(query_tokens))
+
+def _intent_aware_score(it: FAQItem, q: str) -> float:
+    """
+    Composite score tailored for Q/A retrieval.
+    Emphasizes question-field alignment, especially for 'how-to' phrasing.
+    Returns a float; higher is better.
+    """
+    howto = _is_howto_query(q)
+    q_tokens = _content_tokens(q)
+
+    # Core components
+    q_coverage = _coverage(q_tokens, it.question)            # 0..1
+    q_token_sim = _token_set_ratio(q, it.question)           # 0..1
+    combined_sim = _wr_or_ratio(q, _combine_fields_for_match(it))  # 0..1
+
+    # Weighting: lean harder on question alignment for how-to
+    if howto:
+        # favor questions that contain the "action" words; minimize answer-lures
+        score = (0.55 * q_coverage) + (0.30 * q_token_sim) + (0.15 * combined_sim)
+    else:
+        score = (0.40 * q_coverage) + (0.30 * q_token_sim) + (0.30 * combined_sim)
+
+    # Small boost if the item's question starts with a how-to template when query is how-to
+    if howto and it.question.lower().startswith(("how to","how do i","how do you","how can i","how can you")):
+        score += 0.05
+
+    return score
+
+# ------------------------
+# Matchers (using intent-aware score)
+# ------------------------
+
 def _best_match(items: List[FAQItem], q: str) -> Optional[FAQItem]:
-    """Single best match using RapidFuzz if present, else difflib."""
+    """Single best match with intent-aware scoring (how-to bias)."""
     if not items:
         return None
-    ql = q.lower().strip()
+    ql = q.strip()
+    winner, win_score = None, float("-inf")
+
+    # Try a quick RapidFuzz top-k over questions to reduce work (if available),
+    # then rescore with the composite. Fallback: scan all.
+    candidates: List[FAQItem]
     if _HAVE_RAPID:
-        try:
-            choices = { _combine_fields_for_match(it): it for it in items }
-            label, score, _ = rf_process.extractOne(ql, choices.keys(), scorer=rf_fuzz.WRatio)
-            if label is None:
-                return None
-            it = choices[label]
-            return it
-        except Exception:
-            pass
-    # Fallback: difflib with small substring nudge for question field
-    winner, win_score = None, -1.0
-    for it in items:
-        base = _combine_fields_for_match(it).lower()
-        score = difflib.SequenceMatcher(None, ql, base).ratio()
-        if ql in it.question.lower():
-            score += 0.15
-        if score > win_score:
-            winner, win_score = it, score
+        qtexts = [it.question for it in items]
+        prelim = rf_process.extract(ql, qtexts, scorer=rf_fuzz.WRatio, limit=min(25, len(items)))
+        idxs = [i for (_, _, i) in prelim]
+        candidates = [items[i] for i in idxs]
+    else:
+        candidates = items
+
+    for it in candidates:
+        s = _intent_aware_score(it, ql)
+        if s > win_score:
+            winner, win_score = it, s
     return winner
 
 def fuzzy_top(items: List[FAQItem], q: str, n: int = 5) -> List[FAQItem]:
-    """Return top-N fuzzy matches by combined fields (question/tags/answer)."""
+    """Return top-N matches using intent-aware score."""
     if not items:
         return []
-    ql = q.lower().strip()
-
-    if _HAVE_RAPID:
-        choices: List[Tuple[str, int]] = [(_combine_fields_for_match(it), idx) for idx, it in enumerate(items)]
-        ranked = rf_process.extract(ql, choices, scorer=rf_fuzz.WRatio, limit=len(items))
-        scored = []
-        for match_str, score, idx in ranked:
-            bump = 15 if ql in items[idx].question.lower() else 0
-            scored.append((score + bump, items[idx]))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [it for _, it in scored[:n]]
-    else:
-        pool = []
-        for it in items:
-            base = _combine_fields_for_match(it).lower()
-            score = difflib.SequenceMatcher(None, ql, base).ratio()
-            if ql in it.question.lower():
-                score += 0.15
-            pool.append((score, it))
-        pool.sort(key=lambda x: x[0], reverse=True)
-        return [it for _, it in pool[:n]]
+    ql = q.strip()
+    scored = [(_intent_aware_score(it, ql), it) for it in items]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, it in scored[:n]]
 
 def search_items(items: List[FAQItem], term: str, limit: int = 20) -> List[FAQItem]:
     term_l = term.strip().lower()
@@ -297,7 +368,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if args.interactive:
         return interactive_ask(args.file, limit=args.limit)
 
-    # Non-interactive: behave like old `best`
+    # Non-interactive: behave like old `best` with intent-aware scoring
     q = " ".join(args.query).strip()
     return answer_best(args.file, q, questions_only=False)
 
