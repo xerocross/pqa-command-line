@@ -2,19 +2,20 @@
 """
 pfq — Personal FAQ CLI
 - Stores items as JSON Lines (JSONL)
-- Commands: add, ask, best, search, list, repl
-- REPL has tab-completion of known questions (readline-based)
+- Commands: add, ask, best (DEPRECATED), search, list
+- Interactive ask mode via `pfq ask -i` (prompt_toolkit fuzzy REPL if available)
 
-New:
+Matching:
 - RapidFuzz-backed fuzzy matching (fallback to difflib)
-- `best` subcommand for one-shot, non-interactive "show me the closest answer"
-- If invoked as `pqa`, behaves like `pfq best ...`
+- Non-interactive `ask` prints the single best match (previously `best`)
+- `best` is deprecated but still works (emits a warning)
+- If invoked as `pqa`, normal subcommands apply (no implicit rewrite)
 """
 
 from __future__ import annotations
-import argparse, json, os, sys, uuid, datetime, difflib, tempfile, shutil, readline
+import argparse, json, os, sys, uuid, datetime, difflib, tempfile, shutil
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Iterator, Tuple
+from typing import List, Optional, Tuple
 
 # --- Optional fast fuzzy matcher (RapidFuzz). Falls back to difflib. ---
 _HAVE_RAPID = False
@@ -65,58 +66,8 @@ def read_all(path: str) -> List[FAQItem]:
                     "updated_at": obj.get("updated_at", obj.get("created_at", now_iso())),
                 }))
             except Exception:
-                # Skip malformed lines but continue robustly
                 continue
     return items
-
-# --- REPL with robust TAB completion across GNU readline / libedit ---
-
-def init_readline(questions: List[str]) -> None:
-    """
-    Configure readline for whole-line completion and platform quirks.
-    On macOS, Python is often linked against libedit, which needs different bindings.
-    """
-    # Treat the entire input line as a single "word" so we complete whole questions.
-    try:
-        readline.set_completer_delims("")  # no delimiters => whole line is a single token
-    except Exception:
-        pass
-
-    # libedit vs GNU readline binding
-    doc = getattr(readline, "__doc__", "") or ""
-    if "libedit" in doc:
-        # macOS libedit style
-        # ^I is TAB; map it to complete
-        readline.parse_and_bind("bind ^I rl_complete")
-        # libedit doesn't support all 'set' options; keep it minimal
-    else:
-        # GNU readline (Linux, many builds)
-        readline.parse_and_bind("tab: complete")
-        # show list without needing double-tab; if unsupported, it’s ignored
-        try:
-            readline.parse_and_bind("set show-all-if-ambiguous on")
-            readline.parse_and_bind("set completion-ignore-case on")
-        except Exception:
-            pass
-
-    # Basic in-memory completer over the loaded questions
-    _q_sorted = sorted(questions, key=str.lower)
-
-    def _complete(text: str, state: int) -> Optional[str]:
-        """
-        Whole-line prefix completion:
-        - 'text' is what readline thinks is the current token (the whole line, since no delimiters)
-        - We return full replacements (not suffix-only) to keep libedit happy.
-        """
-        prefix = (text or "")
-        pfx_low = prefix.lower()
-        options = [q for q in _q_sorted if q.lower().startswith(pfx_low)]
-        if state < len(options):
-            return options[state]  # full replacement for the (whole-line) token
-        return None
-
-    readline.set_completer(_complete)
-
 
 def write_all_atomic(path: str, items: List[FAQItem]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -128,7 +79,6 @@ def write_all_atomic(path: str, items: List[FAQItem]) -> None:
                 f.write(json.dumps(asdict(it), ensure_ascii=False) + "\n")
         shutil.move(tmp_path, path)
     finally:
-        # If move failed, clean up temp
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -159,24 +109,44 @@ def exact_match(items: List[FAQItem], q: str) -> Optional[FAQItem]:
     return None
 
 def _combine_fields_for_match(it: FAQItem) -> str:
-    # Combined text for matching (does NOT change stored data)
     tg = " ".join(it.tags) if it.tags else ""
     return f"{it.question}\n{tg}\n{it.answer}".strip()
 
+def _best_match(items: List[FAQItem], q: str) -> Optional[FAQItem]:
+    """Single best match using RapidFuzz if present, else difflib."""
+    if not items:
+        return None
+    ql = q.lower().strip()
+    if _HAVE_RAPID:
+        try:
+            choices = { _combine_fields_for_match(it): it for it in items }
+            label, score, _ = rf_process.extractOne(ql, choices.keys(), scorer=rf_fuzz.WRatio)
+            if label is None:
+                return None
+            it = choices[label]
+            return it
+        except Exception:
+            pass
+    # Fallback: difflib with small substring nudge for question field
+    winner, win_score = None, -1.0
+    for it in items:
+        base = _combine_fields_for_match(it).lower()
+        score = difflib.SequenceMatcher(None, ql, base).ratio()
+        if ql in it.question.lower():
+            score += 0.15
+        if score > win_score:
+            winner, win_score = it, score
+    return winner
+
 def fuzzy_top(items: List[FAQItem], q: str, n: int = 5) -> List[FAQItem]:
-    """Return top-N fuzzy matches by question similarity (with substring bump)."""
+    """Return top-N fuzzy matches by combined fields (question/tags/answer)."""
     if not items:
         return []
     ql = q.lower().strip()
 
-    # Prefer RapidFuzz if available; otherwise use difflib
     if _HAVE_RAPID:
-        # We score using weighted ratio over combined fields for better recall.
         choices: List[Tuple[str, int]] = [(_combine_fields_for_match(it), idx) for idx, it in enumerate(items)]
-        # extract returns (match_str, score, data)
         ranked = rf_process.extract(ql, choices, scorer=rf_fuzz.WRatio, limit=len(items))
-        # ranked is list of tuples (match_str, score, data)
-        # Add a small bump if q is a substring of the question field specifically
         scored = []
         for match_str, score, idx in ranked:
             bump = 15 if ql in items[idx].question.lower() else 0
@@ -209,12 +179,27 @@ def search_items(items: List[FAQItem], term: str, limit: int = 20) -> List[FAQIt
 
 def print_item(it: FAQItem, show_answer: bool = True, idx: Optional[int] = None) -> None:
     prefix = f"[{idx}] " if idx is not None else ""
-    print(f"Q: {it.question}")
+    print(f"{prefix}Q: {it.question}")
     if show_answer:
         print(f"   A: {it.answer}")
-    #if it.tags:
-    #    print(f"   tags: {', '.join(it.tags)}")
-    #print(f"   id: {it.id}  created: {it.created_at}  updated: {it.updated_at}")
+
+# --- Core "best answer" routine now shared by ask(non-interactive) and best(deprecated) ---
+
+def answer_best(path: str, query: str, *, questions_only: bool = False) -> int:
+    items = read_all(path)
+    if not items:
+        print("No FAQs yet.")
+        return 0
+    q = (query or "").strip()
+    if not q:
+        print("Provide a query.", file=sys.stderr)
+        return 1
+    it = exact_match(items, q) or _best_match(items, q)
+    if not it:
+        print("No matches.")
+        return 0
+    print_item(it, show_answer=not questions_only)
+    return 0
 
 # --- Commands ---
 
@@ -263,150 +248,70 @@ def cmd_search(args: argparse.Namespace) -> int:
         print_item(it, show_answer=not args.questions_only, idx=i)
     return 0
 
-def cmd_ask(args: argparse.Namespace) -> int:
-    items = read_all(args.file)
-    if not items:
-        print("No FAQs yet.")
-        return 0
-    q = " ".join(args.query).strip()
-    if not q:
-        print("Provide a query.")
-        return 1
-
-    it = exact_match(items, q)
-    if it:
-        print_item(it, show_answer=True)
-        return 0
-
-    candidates = fuzzy_top(items, q, n=5)
-    if not candidates:
-        print("No matches.")
-        return 0
-    print("Closest matches:")
-    for i, c in enumerate(candidates, 1):
-        print(f"[{i}] {c.question}")
-    try:
-        sel = input("Select [1-5] or press Enter to cancel: ").strip()
-    except EOFError:
-        return 1
-    if not sel or not sel.isdigit():
-        return 1
-    k = int(sel)
-    if 1 <= k <= len(candidates):
-        print_item(candidates[k-1], show_answer=True)
-        return 0
-    return 1
-
-def cmd_best(args: argparse.Namespace) -> int:
-    """Non-interactive: print the single best fuzzy match for the query."""
-    items = read_all(args.file)
-    if not items:
-        print("No FAQs yet.")
-        return 0
-    q = " ".join(args.query).strip()
-    if not q:
-        print("Provide a query.")
-        return 1
-    # Prefer exact, else top fuzzy
-    it = exact_match(items, q)
-    if not it:
-        top = fuzzy_top(items, q, n=1)
-        it = top[0] if top else None
-    if not it:
-        print("No matches.")
-        return 0
-    print_item(it, show_answer=not args.questions_only)
-    return 0
-
-# --- REPL with tab-completion of known questions ---
-
-class QuestionCompleter:
-    def __init__(self, questions: List[str]) -> None:
-        self.words = sorted(questions)
-
-    def complete(self, text: str, state: int) -> Optional[str]:
-        options = [w for w in self.words if w.lower().startswith((text or "").lower())]
-        if state < len(options):
-            return options[state]
-        return None
-
-def repl(path: str) -> int:
+def interactive_ask(path: str, limit: int = 5) -> int:
+    """Fuzzy REPL using prompt_toolkit if present; graceful guidance otherwise."""
     items = read_all(path)
     if not items:
         print("No FAQs yet. Use `pfq add` first.")
         return 0
+    try:
+        from prompt_toolkit import prompt
+        from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
+    except Exception:
+        print("Interactive mode requires 'prompt_toolkit'. Try: pip install prompt_toolkit", file=sys.stderr)
+        return 2
 
-    print("pfq REPL — type your question; TAB to complete; :q to quit; :help for commands")
+    questions = [it.question for it in items]
+    completer = FuzzyCompleter(WordCompleter(questions, ignore_case=True))
+    print(f"pfq ask (interactive) — type to fuzzy search • Enter shows best • Ctrl-C/Ctrl-D to exit")
     print(f"(Loaded {len(items)} Qs from {path})")
-    init_readline([it.question for it in items])
 
     while True:
         try:
-            line = input("> ")
-        except (EOFError, KeyboardInterrupt):
+            q = prompt("ask> ", completer=completer, complete_while_typing=True)
+        except (KeyboardInterrupt, EOFError):
             print()
             break
-
-        if line is None:
-            continue
-        line = line.strip()
-        if not line:
+        q = (q or "").strip()
+        if not q:
             continue
 
-        if line in (":q", ":quit", ":exit"):
-            break
-        if line == ":help":
-            print(":help — show this help")
-            print(":list — list all questions")
-            print(":reload — reload data file")
-            print(":add — add a new FAQ interactively")
-            print(":q — quit")
-            continue
-        if line == ":list":
-            for i, it in enumerate(items, 1):
-                print(f"[{i}] {it.question}")
-            continue
-        if line == ":reload":
-            items = read_all(path)
-            init_readline([it.question for it in items])
-            print(f"Reloaded {len(items)} items.")
-            continue
-        if line == ":add":
-            q = input("Question: ").strip()
-            print("Answer (finish with EOF):")
-            chunks: List[str] = []
-            try:
-                while True:
-                    chunks.append(input())
-            except EOFError:
-                pass
-            a = "\n".join(chunks).strip()
-            add_item(path, q, a, [])
-            items = read_all(path)
-            init_readline([it.question for it in items])
-            print("Added.")
-            continue
-
-        # normal question path
-        em = exact_match(items, line)
-        if em:
-            print_item(em, show_answer=True)
-            continue
-
-        guesses = fuzzy_top(items, line, n=5)
-        if not guesses:
+        it = exact_match(items, q) or _best_match(items, q)
+        if not it:
             print("No matches.")
             continue
-        print("Closest:")
-        for i, g in enumerate(guesses, 1):
-            print(f"[{i}] {g.question}")
-        choice = input("Pick [1-5] or Enter to skip: ").strip()
-        if choice.isdigit():
-            ix = int(choice) - 1
-            if 0 <= ix < len(guesses):
-                print_item(guesses[ix], show_answer=True)
 
+        picks = fuzzy_top(items, q, n=max(1, min(limit, 10)))
+        if picks:
+            print("Closest matches:")
+            for i, c in enumerate(picks, 1):
+                print(f"[{i}] {c.question}")
+            print()
+            print_item(picks[0], show_answer=True)
+        else:
+            print_item(it, show_answer=True)
     return 0
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    # Keep interactive path exactly as-is
+    if args.interactive:
+        return interactive_ask(args.file, limit=args.limit)
+
+    # Non-interactive: behave like old `best`
+    q = " ".join(args.query).strip()
+    return answer_best(args.file, q, questions_only=False)
+
+def cmd_best(args: argparse.Namespace) -> int:
+    """DEPRECATED: Non-interactive single best match (kept for compatibility)."""
+    q = " ".join(args.query).strip()
+    print(
+        "warning: 'pfq best' is deprecated and will be removed in a future release. "
+        "Use: pfq ask <query>",
+        file=sys.stderr,
+    )
+    return answer_best(args.file, q, questions_only=args.questions_only)
+
+# --- CLI ---
 
 def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=prog or "pfq", description="Personal FAQ (JSONL-backed)")
@@ -429,17 +334,22 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     sp.add_argument("--questions-only", action="store_true", help="Hide answers in output")
     sp.set_defaults(func=cmd_search)
 
-    sp = sub.add_parser("ask", help="Ask a question (exact/fuzzy, interactive)")
-    sp.add_argument("query", nargs=argparse.REMAINDER, help="Your question")
+    sp = sub.add_parser("ask", help="Ask a question (use -i for interactive REPL; non-interactive prints single best match)")
+    sp.add_argument("-i", "--interactive", action="store_true",
+                    help="Interactive fuzzy mode (prompt_toolkit if available)")
+    sp.add_argument("--limit", type=int, default=5,
+                    help="Interactive mode: how many close matches to show (default: 5)")
+    sp.add_argument("query", nargs=argparse.REMAINDER, help="Your question (omit with -i)")
     sp.set_defaults(func=cmd_ask)
 
-    sp = sub.add_parser("best", help="Non-interactive: print best fuzzy match")
+    sp = sub.add_parser("best", help="DEPRECATED: Non-interactive single best match (use 'pfq ask <query>')")
     sp.add_argument("query", nargs=argparse.REMAINDER, help="Your question")
     sp.add_argument("--questions-only", action="store_true", help="Hide answer")
     sp.set_defaults(func=cmd_best)
 
-    sp = sub.add_parser("repl", help="Interactive mode with TAB completion")
-    sp.set_defaults(func=lambda a: repl(a.file))
+    # Compatibility shim: `pfq repl` behaves like `pfq ask -i`
+    sp = sub.add_parser("repl", help="(deprecated) use: pfq ask -i")
+    sp.set_defaults(func=lambda a: interactive_ask(a.file))
 
     return p
 
@@ -448,21 +358,7 @@ def _invoked_as_pqa() -> bool:
     return base in {"pqa", "pfqa"}
 
 def main(argv: List[str]) -> int:
-    # If invoked as `pqa`, treat as `pfq best <args>`
-    if _invoked_as_pqa():
-        parser = build_parser(prog="pqa")
-        # Shim: if user passes nothing, show help; otherwise force 'best'
-        # if argv and argv[0] in {"-h", "--help"}:
-        #     # Build a temp parser to show 'best' usage succinctly
-        #     print("Usage: pqa [--file PATH] <your question...>\n       pqa --help")
-        #     return 0
-        # Prepend the implicit 'best' subcommand
-        # argv = ["best"] + argv
-        args = parser.parse_args(argv)
-        ensure_store(args.file)
-        return args.func(args)
-
-    parser = build_parser(prog="pfq")
+    parser = build_parser(prog="pqa" if _invoked_as_pqa() else "pfq")
     args = parser.parse_args(argv)
     ensure_store(args.file)
     return args.func(args)
