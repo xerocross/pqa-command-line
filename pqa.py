@@ -12,10 +12,13 @@ Matching:
 - Intent-aware scoring: 'how-to' phrasing biases toward question-field coverage
 """
 
+VERSION = 0.1.1
+
 from __future__ import annotations
 import argparse, json, os, sys, uuid, datetime, difflib, tempfile, shutil, re
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Set
+from pathlib import Path  # <-- added
 
 # --- Optional fast fuzzy matcher (RapidFuzz). Falls back to difflib. ---
 _HAVE_RAPID = False
@@ -25,8 +28,58 @@ try:
 except Exception:
     _HAVE_RAPID = False
 
-DEFAULT_DIR = os.path.expanduser("~/.personal_faq")
-DEFAULT_FILE = os.path.join(DEFAULT_DIR, "faqs.jsonl")
+# ---------------------------------------------------------------------
+# Storage location resolution (CLI --file > env PFQ_FILE > config file)
+# Config file: ~/.config/pfq/config.txt with key `data_file_path=...`
+# If neither CLI nor env override is set, config is REQUIRED.
+# ---------------------------------------------------------------------
+CONFIG_PATH = Path.home() / ".config" / "pfq" / "config.txt"
+
+def _load_config_data_path() -> Path:
+    if not CONFIG_PATH.exists():
+        sys.exit(f"Config file not found: {CONFIG_PATH}\n"
+                 f"Create it with a line like:\n"
+                 f"  data_file_path=~/Documents/pfq/faqs.jsonl")
+    try:
+        raw = CONFIG_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        sys.exit(f"Failed to read config file {CONFIG_PATH}: {e}")
+    cfg = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            # skip malformed lines (keeps it lenient, like wipflow)
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip()
+    val = cfg.get("data_file_path")
+    if not val:
+        sys.exit(f"Missing 'data_file_path' in {CONFIG_PATH}")
+    p = Path(os.path.expandvars(os.path.expanduser(val))).resolve()
+    # parent dir should exist or be creatable
+    parent = p.parent
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            sys.exit(f"Cannot create parent directory for data file {p}: {e}")
+    return p
+
+def resolve_store_path(cli_file: Optional[str]) -> str:
+    """
+    Choose the JSONL store path with precedence:
+      1) CLI --file
+      2) PFQ_FILE env var
+      3) Config file (required if 1/2 not set)
+    """
+    if cli_file:
+        return os.path.expandvars(os.path.expanduser(cli_file))
+    env = os.environ.get("PFQ_FILE")
+    if env:
+        return os.path.expandvars(os.path.expanduser(env))
+    return str(_load_config_data_path())
 
 @dataclass
 class FAQItem:
@@ -386,8 +439,12 @@ def cmd_best(args: argparse.Namespace) -> int:
 
 def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=prog or "pfq", description="Personal FAQ (JSONL-backed)")
-    p.add_argument("--file", default=os.environ.get("PFQ_FILE", DEFAULT_FILE),
-                   help=f"Path to JSONL store (default: {DEFAULT_FILE})")
+    # default=None ensures we can detect absence and then require config
+    p.add_argument(
+        "--file",
+        default=None,
+        help="Path to JSONL store. Precedence: --file > PFQ_FILE env > config (~/.config/pfq/config.txt)"
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("add", help="Add a new Q/A")
@@ -431,6 +488,11 @@ def _invoked_as_pqa() -> bool:
 def main(argv: List[str]) -> int:
     parser = build_parser(prog="pqa" if _invoked_as_pqa() else "pfq")
     args = parser.parse_args(argv)
+
+    # Resolve the store path using precedence (CLI > env > config)
+    resolved = resolve_store_path(args.file)
+    args.file = resolved
+
     ensure_store(args.file)
     return args.func(args)
 
